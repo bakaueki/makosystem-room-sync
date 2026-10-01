@@ -22,6 +22,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Database from 'better-sqlite3'
+import { pulledSyncTargets } from '../lib/room-sync-routing.mjs'
 
 const ROOT = process.env.MAKO_ROOT
   ? path.resolve(process.env.MAKO_ROOT)
@@ -92,6 +93,7 @@ function loadConfig() {
       return at > 0 ? { local: pair.slice(0, at).trim(), remote: pair.slice(at + 1).trim() } : null
     })
 
+  const multiGroups = new Set((process.env.ROOM_SYNC_MULTI_GROUPS || '').split(',').map(s => s.trim()).filter(Boolean))
   const problems = []
   if (!/^https?:\/\//.test(url)) problems.push('ROOM_SYNC_URL が無い（例 https://sync.makoman.uk）')
   if (secret.length < 32) problems.push('ROOM_SYNC_SECRET が無いか短い（相手から受け取った合言葉を貼る）')
@@ -99,22 +101,21 @@ function loadConfig() {
   if (rooms.length === 0 || rooms.some((r) => !r || !r.local || !r.remote)) {
     problems.push('ROOM_SYNC_ROOMS は <自分の部屋 id>=<相手の部屋 id>（例 r1a2b3c=buygift-joint）')
   }
+  if (rooms.some(r => r && rooms.some(other => other && other !== r && (other.local === r.local || other.remote === r.remote)))) problems.push('ROOM_SYNC_ROOMS の部屋 id が重複している')
+  if ([...multiGroups].some(g => !rooms.some(r => r?.remote === g))) problems.push('ROOM_SYNC_MULTI_GROUPS に対応する部屋が ROOM_SYNC_ROOMS に無い')
   if (problems.length) {
     for (const p of problems) console.error(`設定: ${p}`)
     console.error('.env を直したら、もう一度『つなぐ』をダブルクリックしてください。手順は docs/room-sync.md')
     process.exit(78)
   }
-  return { url, secret, site, humanName, rooms }
+  return { url, secret, site, humanName, rooms, multiGroups }
 }
 
 // ─── DB ──────────────────────────────────────────────
 
-function openDb() {
-  if (!fs.existsSync(DB_PATH)) {
-    console.error(`DB が見つからない: ${DB_PATH}（先に画面を一度起動してください）`)
-    process.exit(78)
-  }
-  const db = new Database(DB_PATH)
+export function openDb(dbPath = DB_PATH) {
+  if (!fs.existsSync(dbPath)) throw new Error(`DB が見つからない: ${dbPath}（先に画面を一度起動してください）`)
+  const db = new Database(dbPath)
   // 画面とブリッジも同じファイルを開いているので、WAL と待ち時間を揃える
   db.pragma('journal_mode = WAL')
   db.pragma('busy_timeout = 5000')
@@ -181,6 +182,7 @@ async function call(cfg, method, pathWithQuery, bodyObj) {
     'X-Sync-Site': cfg.site,
     'X-Sync-Ts': ts,
     'X-Sync-Sign': sign(cfg.secret, ts, method, pathWithQuery, body),
+    'X-Sync-Protocol': '2',
   }
   if (body) headers['Content-Type'] = 'application/json'
   const res = await fetch(cfg.url + pathWithQuery, {
@@ -203,6 +205,7 @@ function explainStatus(status) {
   if (status === 401) return '401＝合言葉が違うか、この PC の時計が 5 分以上ずれている'
   if (status === 403) return '403＝相手がこの部屋の同期を許可していない（部屋 id を相手に確認）'
   if (status === 503) return '503＝相手側で同期の設定がまだ入っていない'
+  if (status === 426) return '426＝複数人同期の更新版が必要（投稿は保留）'
   if (status >= 300 && status < 400) return `${status}＝ログイン画面へ飛ばされた（URL を相手に確認）`
   return String(status)
 }
@@ -211,7 +214,7 @@ function explainStatus(status) {
 
 const failures = new Map()
 
-async function pushRoom(db, cfg, map, agents) {
+export async function pushRoom(db, cfg, map, agents) {
   const state = db.prepare('SELECT * FROM sync_state WHERE room_id = ?').get(map.local) ?? {
     last_pushed_updated_at: '',
   }
@@ -252,6 +255,7 @@ async function pushRoom(db, cfg, map, agents) {
       sender_kind: row.sender === 'human' ? 'human' : 'ai',
       content,
       created_at: row.created_at,
+      ...(cfg.multiGroups?.has(map.remote) ? { mention_mode: 'scoped' } : {}),
     }
     let r
     try {
@@ -272,7 +276,7 @@ async function pushRoom(db, cfg, map, agents) {
       // 相手側で直前に同じ文面が入った。数秒後に送り直せば通るので、順番を守ってここで止める
       return
     }
-    if (r.status === 401 || r.status === 403 || r.status === 503 || r.status >= 500 || (r.status >= 300 && r.status < 400)) {
+    if (r.status === 401 || r.status === 403 || r.status === 426 || r.status === 503 || r.status >= 500 || (r.status >= 300 && r.status < 400)) {
       // 設定や相手の都合。投稿のせいではないので諦めず、直るまで待つ
       logOnce('push', `[push] 送れない: ${explainStatus(r.status)} ${r.json?.error ?? ''}`.trim())
       return
@@ -302,7 +306,7 @@ function allowAiWake(roomId, now = Date.now()) {
   return true
 }
 
-async function pullRoom(db, cfg, map, agents) {
+export async function pullRoom(db, cfg, map, agents) {
   const state = db.prepare('SELECT * FROM sync_state WHERE room_id = ?').get(map.local) ?? {
     last_pulled_remote_id: 0,
   }
@@ -320,6 +324,14 @@ async function pullRoom(db, cfg, map, agents) {
     return
   }
   clearProblem('pull')
+
+  const scoped = r.json.protocol === 2 && r.json.mention_mode === 'scoped'
+  // API・ブリッジも同じ部屋設定を使う。同期プロセスだけ更新したPCは受信を進めない。
+  if (scoped !== !!cfg.multiGroups?.has(map.remote)) {
+    logOnce('mode', '[pull] ROOM_SYNC_MULTI_GROUPS が相手の部屋設定と異なる。設定をそろえるまで受信を保留')
+    return
+  }
+  clearProblem('mode')
 
   const origin = String(r.json.origin || 'remote')
   const seen = db.prepare('SELECT 1 FROM sync_pulled WHERE origin = ? AND remote_id = ?')
@@ -344,7 +356,12 @@ async function pullRoom(db, cfg, map, agents) {
       if (!content) continue
       const name = String(m.sender_name || m.sender || '相手').replace(/\s+/g, ' ').slice(0, 40)
       const kind = m.sender_kind === 'human' ? 'human' : 'ai'
-      let wake = mentionsLocalAgent(content, agents)
+      const senderOrigin = scoped ? String(m.origin || '') : origin
+      if (scoped && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$/.test(senderOrigin)) throw new Error('相手拠点名のない投稿は受信しない')
+      // 自分発はサーバーでも除く。再取込・二重表示を防ぐ最後の歯止め。
+      if (scoped && senderOrigin === cfg.site) continue
+      const targets = pulledSyncTargets(content, cfg.site, agents.map(a => a.id), scoped)
+      let wake = targets === null ? mentionsLocalAgent(content, agents) : targets.length > 0
       if (wake && kind === 'ai' && !allowAiWake(map.local)) {
         wake = false
         log(`[pull] 相手の AI からの呼び出しが多すぎるので起こさない（${map.local}・10 分で ${AI_WAKE_MAX} 回まで）`)
@@ -352,9 +369,9 @@ async function pullRoom(db, cfg, map, agents) {
       const t = localNow()
       const res = insertMsg.run(
         map.local,
-        `remote:${name}`,
+        scoped ? `remote:${name}（${senderOrigin}）` : `remote:${name}`,
         content,
-        JSON.stringify({ remote: { origin, id: m.id, kind } }),
+        JSON.stringify({ remote: { origin: senderOrigin, id: m.id, kind, hub: origin }, ...(targets !== null ? { sync_targets: wake ? targets : [] } : {}) }),
         wake ? 'pending' : 'done',
         t,
         t
@@ -377,7 +394,11 @@ async function pullRoom(db, cfg, map, agents) {
 
 async function main() {
   const cfg = loadConfig()
-  const db = openDb()
+  let db
+  try { db = openDb() } catch (e) {
+    console.error(e.message)
+    process.exit(78)
+  }
   const rooms = db.prepare('SELECT id FROM rooms').all().map((r) => r.id)
   for (const m of cfg.rooms) {
     if (!rooms.includes(m.local)) {

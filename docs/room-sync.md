@@ -10,6 +10,38 @@
 
 最初に使う部屋は「バイギフト合同」です。
 
+## 複数人の「メールワイズ」に参加する場合（更新版）
+
+以下は2026-10-01の改修手順です。手元で改修・検証した段階で、あなたのPCに反映済みという意味ではありません。
+独自改修がある場合は差分を照合して適用します。部屋をつなぐ前に、次の6ファイルを更新版へそろえてください。
+
+- `scripts/room-sync.mjs`
+- `lib/room-sync-routing.mjs` と `lib/room-sync-routing.d.mts`
+- `bridge/targets.ts` と `bridge/index.ts`
+- `app/api/messages/route.ts`
+
+接続キーは人ごとに違います。Makotoから自分用のキー・拠点名・部屋idを受け取り、**空の新しい「メールワイズ」部屋**を作って設定します。既存の私的な部屋を指定すると、その過去の投稿まで共有されます。
+
+```dotenv
+ROOM_SYNC_URL=https://sync.makoman.uk
+ROOM_SYNC_SECRET=（自分専用のキー）
+ROOM_SYNC_SITE=（自分専用の拠点名）
+ROOM_SYNC_ROOMS=（作成した自分の部屋id）=mailwise-joint
+ROOM_SYNC_MULTI_GROUPS=mailwise-joint
+ROOM_SYNC_HUMAN_NAME=（自分の表示名）
+```
+
+フナキチは `ROOM_SYNC_ROOMS` の既存のバイギフト合同の設定を残し、カンマ区切りでメールワイズを追加します。`ROOM_SYNC_MULTI_GROUPS` は**本体側の部屋id**です。追加2人にバイギフト合同のキーやアクセス権は渡しません。
+設定後は画面・ブリッジ・`つなぐ` をいったん終了して起動し直します。同期の窓だけの再起動では、画面とブリッジの宛先判定に新しい設定が入りません。
+
+複数人部屋のAIは `@拠点名/AI-id` で呼びます。たとえば `@funakichi/commander` はフナキチのAI、`@makoman/codex` はMakoto側のハンジです。自分のAIにも同じ書き方を使ってください。
+`@commander` だけでは誰のAIか決まらないため起こしません。宛先のない会話は人同士の会話として共有されます。
+投稿には名前と拠点が表示され、自分の投稿が二重に戻ることはありません。接続が切れた時や更新が必要な時は投稿を保留し、直った後に再送します。
+
+既存の2人用の部屋は下記の従来手順を継続できます。画像・添付そのものの同期、同期済み投稿の編集や削除の追従は含みません。
+
+開発者向け確認: `node --import tsx --test scripts/tests/room-sync-routing.test.ts`。投稿APIの実DBテストは `MAKO_ROOT` と `ROOM_SYNC_TEST_DIR` に同一の新しいQA専用フォルダを指定して `scripts/tests/room-sync-message-api.test.ts` を実行します。
+
 ## 必要な物（相手から受け取る）
 
 | 物 | 例 | 使う所 |
