@@ -3,8 +3,8 @@ import { isInside } from '@/lib/uploads'
 import { UPLOADS_DIR } from '@/lib/paths'
 import { isNoAgent, toView } from '@/lib/messages'
 import { localNow } from '@/lib/time'
-import { loadAgents } from '@/lib/agents'
-import { localSyncTargets } from '@/lib/room-sync-routing.mjs'
+import { loadAgents, parseMentions } from '@/lib/agents'
+import { localHumanSyncTargets, localSyncTargets } from '@/lib/room-sync-routing.mjs'
 import type { Attachment, Message, MessageMeta } from '@/lib/types'
 
 export async function GET(request: Request) {
@@ -101,11 +101,16 @@ export async function POST(request: Request) {
   if (buttons.length) meta.buttons = buttons
   if (typeof body.target === 'string' && body.target.trim()) meta.target = body.target.trim()
 
-  // 誰も起こさない投稿は取り出し対象にしない。ブリッジは status='pending' しか見ない
-  const syncTargets = localSyncTargets(room, content, loadAgents().map(a => a.id))
+  const sender = body.system === true ? 'system' : 'human'
+  // 誰も起こさない投稿は取り出し対象にしない。ブリッジは status='pending' しか見ない。
+  // 複数人の部屋でも、この PC の人が書いた @名前・@id は自分の AI への宛先になる
+  const agents = loadAgents()
+  const ids = agents.map(a => a.id)
+  const syncTargets = sender === 'human'
+    ? localHumanSyncTargets(room, content, ids, text => parseMentions(text, agents))
+    : localSyncTargets(room, content, ids)
   if (syncTargets !== null) meta.sync_targets = syncTargets
   const noAgent = isNoAgent(body) || syncTargets?.length === 0
-  const sender = body.system === true ? 'system' : 'human'
 
   const now = localNow()
   const res = db
